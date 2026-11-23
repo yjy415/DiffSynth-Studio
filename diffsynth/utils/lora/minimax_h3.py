@@ -1,5 +1,23 @@
-from .general import GeneralLoRALoader
 import torch
+from ...core.vram.disk_map import DiskMap
+from ..state_dict_converters.minimax_h3_dit import minimax_h3_diffusers_parameter_name
+from .general import GeneralLoRALoader
+
+
+def load_minimax_h3_pi_lora(path):
+    weights = DiskMap(path, device="cpu")
+    state_dict = {}
+    for name in weights:
+        if not name.endswith((".lora_A.weight", ".lora_B.weight")):
+            continue
+        layer, factor, _ = name.rsplit(".", 2)
+        target = minimax_h3_diffusers_parameter_name(layer + ".weight").removesuffix(".weight")
+        weight = weights[name]
+        if factor == "lora_B" and target.endswith(".mlp.fc1"):
+            up, gate = weight.chunk(2, dim=0)
+            weight = torch.cat((gate, up), dim=0)
+        state_dict[f"{target}.{factor}.weight"] = weight
+    return state_dict
 
 
 class MiniMaxH3LoRALoader(GeneralLoRALoader):

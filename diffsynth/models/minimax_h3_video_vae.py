@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import math
-
-import torch
+import math, torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from torchvision.transforms import Normalize
 
 from ..core.attention import attention_forward
-from einops import repeat
 
 
 class WarpedTensor(torch.nn.Module):
@@ -519,7 +516,10 @@ class MiniMaxH3VideoVAE(nn.Module):
         return self._decode_temporal_streaming(z, num_chunks, pad_tokens)
 
     @torch.no_grad()
-    def encode_video(self, video, dtype=None, process_image=False, tiled=True, tile_size=256, tile_overlap=64):
+    def encode_video(
+        self, video, dtype=None, process_image=False,
+        tiled=True, tile_size=256, tile_overlap=64, posterior_seed=None,
+    ):
         device, out_dtype = video.device, video.dtype
         x = self.processor.transform_tensor(video.to(torch.float32)).to(device=device, dtype=dtype or out_dtype)
         self.tile_size, self.tile_overlap_min = tile_size, tile_overlap
@@ -529,9 +529,14 @@ class MiniMaxH3VideoVAE(nn.Module):
             moments = self.tiled_encode(x)
         else:
             moments = self.encode_temporal(x)
-        z = torch.chunk(moments, 2, dim=1)[0]
+        z, logvar = moments.chunk(2, dim=1)
         if process_image:
             z = z[:, :, :1]
+            logvar = logvar[:, :, :1]
+        if posterior_seed is not None:
+            generator = torch.Generator().manual_seed(posterior_seed)
+            noise = torch.randn(z.shape, generator=generator, dtype=z.dtype, device="cpu").to(z.device)
+            z = (z + (0.5 * logvar.clamp(-30.0, 20.0)).exp() * noise).half()
         mean = torch.tensor(_VIDEO_LATENTS_MEAN, device=z.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
         std = torch.tensor(_VIDEO_LATENTS_STD, device=z.device, dtype=torch.float32).view(1, -1, 1, 1, 1)
         return ((z.float() - mean) / std).to(out_dtype)

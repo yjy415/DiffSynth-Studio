@@ -1,25 +1,25 @@
-import math
+import math, re, torch
+from dataclasses import replace
+from pathlib import Path
+
 import numpy as np
-import torch
 from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor
 
 from ..core import ModelConfig
 from ..core.device.npu_compatible_device import get_device_type
+from ..core.loader import hash_model_file
 from ..diffusion import FlowMatchScheduler
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
-from ..models.minimax_h3_dit import MiniMaxH3DiT, patchify_video, unpatchify_video, pack_audio, unpack_audio
-from ..models.minimax_h3_text_encoder import (
-    MiniMaxH3TextEncoder, presentation_t2va, presentation_fl2va, presentation_ref2va,
-    sample_qwen_video_frames, image_token_counts, video_token_counts,
-)
-from ..models.minimax_h3_video_vae import MiniMaxH3VideoVAE
 from ..models.minimax_h3_audio_vae import MiniMaxH3AudioVAE
 from ..models.minimax_h3_controlnet import MiniMaxH3ControlNet
+from ..models.minimax_h3_dit import MiniMaxH3DiT, patchify_video, unpatchify_video, pack_audio, unpack_audio
 from ..models.minimax_h3_dit_vdn import MiniMaxH3VDNLayout, enable_minimax_h3_vdn, initialize_vdn
+from ..models.minimax_h3_text_encoder import MiniMaxH3TextEncoder, presentation_t2va, presentation_fl2va, presentation_ref2va, sample_qwen_video_frames, image_token_counts, video_token_counts
+from ..models.minimax_h3_video_vae import MiniMaxH3VideoVAE
 from ..utils.data.audio import convert_to_stereo, resample_waveform
-from ..utils.lora.minimax_h3 import MiniMaxH3LoRALoader
+from ..utils.lora.minimax_h3 import MiniMaxH3LoRALoader, load_minimax_h3_pi_lora
 
 
 class MiniMaxH3Pipeline(BasePipeline):
@@ -33,6 +33,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.video_vae: MiniMaxH3VideoVAE = None
         self.audio_vae: MiniMaxH3AudioVAE = None
         self.controlnet: MiniMaxH3ControlNet = None
+        self.pi_h3_num_steps = None
+        self.pi_h3_dwd = None
         self.tokenizer = None
         self.processor = None
         self.imgvid_cond_noise_aug = 0.999
@@ -57,12 +59,16 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @staticmethod
     def from_pretrained(
+        # Model loading
         torch_dtype: torch.dtype = torch.bfloat16,
         device: str = get_device_type(),
         model_configs: list[ModelConfig] = [],
         processor_config: ModelConfig = ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/processor/"),
         vram_limit: float = None,
         redirect_common_files: bool = True,
+        # pi-H3 adapter
+        pi_h3_adapter_config: ModelConfig = None,
+        pi_h3_num_steps: int = None,
     ):
         if redirect_common_files:
             redirect_dict = {
@@ -78,15 +84,42 @@ class MiniMaxH3Pipeline(BasePipeline):
                     print(f"The model is detected to be downloading from HuggingFace. {processor_config.model_id} is redirected to {redirect_dict[processor_config.model_id]}. You can use `redirect_common_files=False` to disable file redirection.")
                     processor_config.model_id = redirect_dict[processor_config.model_id]
         pipe = MiniMaxH3Pipeline(device=device, torch_dtype=torch_dtype)
+        if pi_h3_adapter_config is not None:
+            model_configs, adapter_path, pi_h3_num_steps = pipe._prepare_pi_h3_configs(
+                model_configs, pi_h3_adapter_config, pi_h3_num_steps,
+            )
+        elif pi_h3_num_steps is not None:
+            raise ValueError("pi_h3_num_steps requires a pi_h3_adapter_config.")
+
         model_pool = pipe.download_and_load_models(model_configs, vram_limit)
         pipe.text_encoder = model_pool.fetch_model("minimax_h3_text_encoder")
-        pipe.dit = model_pool.fetch_model("minimax_h3_dit")
+        pipe.dit = model_pool.fetch_model("minimax_h3_dit", index="all" if pi_h3_adapter_config is not None else None)
         pipe.video_vae = model_pool.fetch_model("minimax_h3_video_vae")
         pipe.audio_vae = model_pool.fetch_model("minimax_h3_audio_vae")
         pipe.controlnet = model_pool.fetch_model("minimax_h3_controlnet")
         vdn_branch = model_pool.fetch_model("minimax_h3_vdn_linear_branch")
-        if vdn_branch is not None:
+
+        if pi_h3_adapter_config is not None:
+            if isinstance(pipe.dit, list):
+                raise ValueError("Load only the official Pruned DiT when using a pi-H3 adapter.")
+            if vdn_branch is not None or pipe.controlnet is not None:
+                raise ValueError("pi-H3 uses the Pruned FL2VA DiT without VDN or ControlNet.")
+            pipe.dit = pipe.enable_lora_hot_loading(pipe.dit)
+            pipe.load_lora(pipe.dit, state_dict=load_minimax_h3_pi_lora(adapter_path), hotload=True)
+            pipe.pi_h3_dwd = model_pool.fetch_model("minimax_h3_pi_dwd")
+            pipe.pi_h3_num_steps = pi_h3_num_steps
+            pipe.scheduler = FlowMatchScheduler("MiniMax-H3-Pi")
+            pipe.scheduler_audio = FlowMatchScheduler("MiniMax-H3-Pi")
+            pipe.units = [
+                MiniMaxH3Unit_ShapeChecker(),
+                MiniMaxH3Unit_PiKeyframes(),
+                MiniMaxH3Unit_PiNoiseInitializer(),
+                MiniMaxH3Unit_PromptEmbedder(),
+                MiniMaxH3Unit_PackedSequenceBuilder(),
+            ]
+        elif vdn_branch is not None:
             enable_minimax_h3_vdn(pipe.dit, vdn_branch)
+
         if processor_config is not None:
             processor_config.download_if_necessary()
             pipe.processor = AutoProcessor.from_pretrained(processor_config.path)
@@ -94,23 +127,65 @@ class MiniMaxH3Pipeline(BasePipeline):
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
 
+    @staticmethod
+    def _prepare_pi_h3_configs(model_configs, config, num_steps):
+        config = replace(config)
+        config.download_if_necessary()
+        if not isinstance(config.path, (str, Path)):
+            raise ValueError("pi_h3_adapter_config must resolve to one safetensors file or adapter directory.")
+        path = Path(config.path)
+        if path.is_dir():
+            path = path / "diffusion_pytorch_model.safetensors"
+        variant = re.fullmatch(r"pi_h3_([24])step(?:_dwd)?_adapter", path.parent.name)
+        if variant is not None:
+            variant_steps = int(variant[1])
+            if num_steps is not None and num_steps != variant_steps:
+                raise ValueError(f"{path.parent.name} requires {variant_steps} inference steps.")
+            num_steps = variant_steps
+        if num_steps not in (2, 4):
+            raise ValueError("Specify pi_h3_num_steps=2 or 4 for an adapter outside its original directory.")
+
+        configs = [replace(model_config) for model_config in model_configs]
+        for model_config in configs:
+            model_config.download_if_necessary()
+        base_configs = [
+            model_config for model_config in configs
+            if model_config.path and hash_model_file(model_config.path) == "11ff8e29fe45353c983eab86a36ec919"
+        ]
+        if len(base_configs) != 1:
+            raise ValueError("Include one official MiniMax-H3-Pruned transformer ModelConfig when loading pi-H3.")
+        base_config = base_configs[0]
+        if base_config.offload_device == "disk" or base_config.quantize is not None:
+            raise ValueError("Use floating-point device loading or CPU offload for the pi-H3 DiT.")
+        if base_config.state_dict is not None or base_config.clear_parameters:
+            raise ValueError("Load the pi-H3 DiT from the official checkpoint shards.")
+        base_paths = base_config.path if isinstance(base_config.path, list) else [base_config.path]
+        # DiskMap applies the adapter's weight overrides in file order.
+        base_config.path = [*base_paths, str(path)]
+        return configs, str(path), num_steps
+
     @torch.no_grad()
     def __call__(
         self,
+        # Prompts
         prompt: str = None,
         negative_prompt: str = " ",
+        # Video shape
         height: int = 768,
         width: int = 1344,
         num_frames: int = 124,
+        # Sampling
         num_inference_steps: int = 50,
         seed: int = 42,
         rand_device: str = "cpu",
         cfg_scale: float = 1.0,
         flow_shift: float = 12.0,
         audio_flow_shift: float = 3.0,
+        # VAE tiling
         tiled: bool = True,
         tile_size: int = 256,
         tile_overlap: int = 64,
+        # Gradient checkpointing
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         # Keyframe to Video
@@ -130,8 +205,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         retake_audio: torch.Tensor = None,
         retake_audio_sample_rate: int = 32000,
         seconds_regions_to_retake: list[tuple[float, float]] = None,
+        # Progress bar and text embedding
         progress_bar_cmd=tqdm,
-        # Template inputs
         text_embedding: torch.Tensor = None,
     ):
         """Generate a joint video + audio sample.
@@ -153,9 +228,21 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         Input contract: `video` frame lists must ALREADY. be 24fps the pipeline never resamples frame rate.
         """
+        # Scheduler
+        pi_h3 = self.pi_h3_num_steps is not None
+        if pi_h3:
+            if num_inference_steps != self.pi_h3_num_steps:
+                raise ValueError(f"The loaded pi-H3 adapter requires {self.pi_h3_num_steps} inference steps.")
+            if cfg_scale != 1.0 or (flow_shift, audio_flow_shift) != (12.0, 3.0):
+                raise ValueError("pi-H3 requires cfg_scale=1, flow_shift=12 and audio_flow_shift=3.")
+            if references or control_video is not None or retake_video is not None or retake_audio is not None:
+                raise ValueError("pi-H3 supports text and first/last keyframe conditioning.")
+            if self.video_vae is None and (keyframes or self.pi_h3_dwd is None):
+                raise ValueError("pi-H3 needs a video VAE for keyframe conditioning and non-DWD decoding.")
         self.scheduler.set_timesteps(num_inference_steps, shift=flow_shift)
         self.scheduler_audio.set_timesteps(num_inference_steps, shift=audio_flow_shift)
 
+        # Parameters
         inputs_posi = {"prompt": prompt}
         inputs_nega = {"negative_prompt": negative_prompt}
         inputs_shared = {
@@ -166,28 +253,36 @@ class MiniMaxH3Pipeline(BasePipeline):
             "use_gradient_checkpointing": use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
             "keyframes": keyframes, "keyframe_indices": keyframe_indices,
-            "references": references, "ref_image_short_edge": ref_image_short_edge, "ref_video_short_edge": ref_video_short_edge, "ref_video_max_pixels": ref_video_max_pixels,
+            "references": references, "ref_image_short_edge": ref_image_short_edge,
+            "ref_video_short_edge": ref_video_short_edge, "ref_video_max_pixels": ref_video_max_pixels,
             "control_video": control_video, "control_scale": control_scale,
             "retake_video": retake_video, "frame_regions_to_retake": frame_regions_to_retake,
-            "retake_audio": (retake_audio, retake_audio_sample_rate) if retake_audio is not None else None, "seconds_regions_to_retake": seconds_regions_to_retake,
+            "retake_audio": (retake_audio, retake_audio_sample_rate) if retake_audio is not None else None,
+            "seconds_regions_to_retake": seconds_regions_to_retake,
             "imgvid_cond_noise_aug": self.imgvid_cond_noise_aug, "audio_cond_noise_aug": self.audio_cond_noise_aug,
             "text_embedding": text_embedding,
         }
-
-        # 3. Unit chain
+        if pi_h3:
+            inputs_shared["pi_h3"] = True
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
 
-        # 4. Denoise loop
+        # Denoise
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
+        dwd_features = None
         for progress_id, timestep_video in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             timestep_video = timestep_video.unsqueeze(0).to(dtype=torch.float32, device=self.device)
             timestep_audio = self.scheduler_audio.timesteps[progress_id].unsqueeze(0).to(dtype=torch.float32, device=self.device)
-            noise_pred_video, noise_pred_audio = self.cfg_guided_model_fn(
+            decode_pixels = self.pi_h3_dwd is not None and progress_id == num_inference_steps - 1
+            feature_request = {"return_video_features": True} if decode_pixels else {}
+            prediction = self.cfg_guided_model_fn(
                 self.model_fn, cfg_scale, inputs_shared, inputs_posi, inputs_nega,
-                **models, timestep_video=timestep_video, timestep_audio=timestep_audio,
+                **models, timestep_video=timestep_video, timestep_audio=timestep_audio, **feature_request,
             )
+            noise_pred_video, noise_pred_audio = prediction[:2]
+            if decode_pixels:
+                dwd_features = prediction[2]
             inputs_shared["video_latents"] = self.step(
                 self.scheduler, inputs_shared["video_latents"], progress_id, noise_pred=noise_pred_video,
                 inpaint_mask=inputs_shared.get("denoise_mask_video"), input_latents=inputs_shared.get("input_latents_video"),
@@ -197,9 +292,16 @@ class MiniMaxH3Pipeline(BasePipeline):
                 inpaint_mask=inputs_shared.get("denoise_mask_audio"), input_latents=inputs_shared.get("input_latents_audio"),
             )
 
-        # 5. Decode
-        self.load_models_to_device(["video_vae"])
-        frames = self.video_vae.decode_video(inputs_shared["video_latents"], dtype=self.torch_dtype, tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap)
+        # Decode
+        if dwd_features is None:
+            self.load_models_to_device(["video_vae"])
+            frames = self.video_vae.decode_video(
+                inputs_shared["video_latents"], dtype=self.torch_dtype,
+                tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap,
+            )
+        else:
+            self.load_models_to_device(["pi_h3_dwd"])
+            frames = self.pi_h3_dwd(*dwd_features, inputs_shared["pi_h3_video_grid"])
         video = self.vae_output_to_video(frames, min_value=0, max_value=1)
 
         self.load_models_to_device(["audio_vae"])
@@ -209,6 +311,8 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @torch.no_grad()
     def export_text_embedding(self, prompt: str):
+        if self.pi_h3_num_steps is not None:
+            return MiniMaxH3Unit_PromptEmbedder().process(self, prompt)["prompt_embeds"]
         inputs_posi = {"prompt": prompt}
         inputs_nega = {"negative_prompt": ""}
         inputs_shared = {
@@ -232,6 +336,8 @@ class MiniMaxH3Unit_ShapeChecker(PipelineUnit):
 
     def process(self, pipe: MiniMaxH3Pipeline, height, width, num_frames):
         height, width, num_frames = pipe.check_resize_height_width(height, width, num_frames)
+        if pipe.pi_h3_num_steps is not None and not 120 <= num_frames <= 360:
+            raise ValueError("pi-H3 requires 5–15 seconds at 24 fps after aligning the frame count.")
         return {"height": height, "width": width, "num_frames": num_frames}
 
 
@@ -427,6 +533,76 @@ class MiniMaxH3Unit_AudioRetakeEmbedder(PipelineUnit):
         if padded_latents > 0:
             mask[audio_latent_t - padded_latents:] = 1
         return {"input_latents_audio": latents, "denoise_mask_audio": mask.view(1, 1, -1).expand(latents.shape[0], -1, -1)}
+
+
+class MiniMaxH3Unit_PiKeyframes(PipelineUnit):
+
+    def __init__(self):
+        super().__init__(
+            input_params=("keyframes", "keyframe_indices", "seed", "rand_device", "height", "width"),
+            output_params=("keyframes", "keyframe_indices", "keyframe_cond_anchor", "pi_h3_generator"),
+            onload_model_names=("video_vae",),
+        )
+
+    def process(self, pipe: MiniMaxH3Pipeline, keyframes, keyframe_indices, seed, rand_device, height, width):
+        generator = None if seed is None else torch.Generator(rand_device).manual_seed(seed)
+        if not keyframes:
+            if keyframe_indices:
+                raise ValueError("keyframe_indices must have corresponding keyframes.")
+            return {"pi_h3_generator": generator}
+        if (
+            keyframe_indices is None
+            or len(keyframes) != len(keyframe_indices)
+            or len(set(keyframe_indices)) != len(keyframe_indices)
+            or any(index not in (0, -1) for index in keyframe_indices)
+        ):
+            raise ValueError("Provide one unique index (0 or -1) per pi-H3 keyframe.")
+
+        ordered = sorted(zip(keyframe_indices, keyframes), key=lambda entry: entry[0] != 0)
+        pipe.load_models_to_device(self.onload_model_names)
+        images, indices, condition_rows = [], [], []
+        for index, image in ordered:
+            image = image.convert("RGB")
+            if images and image.size != (width, height):
+                scale = max(width / image.width, height / image.height)
+                resized = (max(width, round(image.width * scale)), max(height, round(image.height * scale)))
+                left, top = (resized[0] - width) // 2, (resized[1] - height) // 2
+                image = image.resize(resized, Image.Resampling.LANCZOS).crop((left, top, left + width, top + height))
+            else:
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+            tensor = pipe.preprocess_image(image, torch_dtype=torch.float32, min_value=0)
+            latent = pipe.video_vae.encode_video(tensor, dtype=pipe.torch_dtype, process_image=True, posterior_seed=42)
+            noise = torch.randn(latent.shape, generator=generator, device=rand_device, dtype=torch.float32).to(latent.device)
+            augmentation = pipe.imgvid_cond_noise_aug
+            condition_rows.append(patchify_video(augmentation * latent + (1 - augmentation) * noise))
+            images.append(image)
+            indices.append(index)
+        return {
+            "keyframes": images, "keyframe_indices": indices,
+            "keyframe_cond_anchor": torch.cat(condition_rows), "pi_h3_generator": generator,
+        }
+
+
+class MiniMaxH3Unit_PiNoiseInitializer(PipelineUnit):
+
+    def __init__(self):
+        super().__init__(
+            input_params=("num_frames", "height", "width", "rand_device", "pi_h3_generator"),
+            output_params=("video_latents", "audio_latents", "pi_h3_video_grid"),
+        )
+
+    def process(self, pipe: MiniMaxH3Pipeline, num_frames, height, width, rand_device, pi_h3_generator):
+        video_t, latent_h, latent_w = ((num_frames - 5) // 17) * 5 + 2, height // 16, width // 16
+        audio_t = round(num_frames / 24.0 * 40.0)
+        video_latents = torch.randn(
+            (1, 24, video_t, latent_h, latent_w), generator=pi_h3_generator, device=rand_device, dtype=torch.float32,
+        )
+        audio_rows = torch.randn((2 * audio_t, 32), generator=pi_h3_generator, device=rand_device, dtype=torch.float32)
+        return {
+            "video_latents": video_latents.to(pipe.device),
+            "audio_latents": unpack_audio(audio_rows, 2, audio_t).to(pipe.device),
+            "pi_h3_video_grid": (video_t, latent_h // 2, latent_w // 2),
+        }
 
 
 class MiniMaxH3Unit_KeyframeEncoder(PipelineUnit):
@@ -974,6 +1150,8 @@ def model_fn_minimax_h3(
     control_scale=1.0,
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
+    pi_h3=False,
+    return_video_features=False,
     **kwargs,
 ):
     t_video = 1.0 - float(timestep_video) / 1000
@@ -1050,7 +1228,8 @@ def model_fn_minimax_h3(
     else:
         control_hints = None
 
-    v_video_rows, v_audio_rows = dit(
+    feature_kwargs = {"video_feature_positions": img_pos[cond_rows_count:]} if return_video_features else {}
+    prediction = dit(
         x=x,
         audio_x=audio_x,
         img_position_ids=packed["img_position_ids"],
@@ -1069,11 +1248,16 @@ def model_fn_minimax_h3(
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         control_hints=control_hints,
+        **feature_kwargs,
     )
-
+    v_video_rows, v_audio_rows = prediction[:2]
     v_video_rows = v_video_rows[cond_rows_count:]
     v_audio_rows = v_audio_rows[ref_audio_rows_count:]
 
     v_video = unpatchify_video(v_video_rows, f, h, w)
     v_audio = unpack_audio(v_audio_rows, audio_channel, audio_t)
+    if pi_h3:
+        v_video, v_audio = v_video.float(), v_audio.float()
+    if return_video_features:
+        return -v_video, -v_audio, prediction[2]
     return -v_video, -v_audio

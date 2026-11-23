@@ -84,12 +84,29 @@ write_video_audio(
 |[OpenVDN/vdn-minimax-h3: VDN-H3 8 steps](https://www.modelscope.cn/models/OpenVDN/vdn-minimax-h3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/MiniMax-H3-VDN-Turbo-FL2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/MiniMax-H3-VDN-Turbo-FL2VA.py)|-|-|-|-|
 |[OpenVDN/vdn-minimax-h3: VDN-H3 FP8](https://www.modelscope.cn/models/OpenVDN/vdn-minimax-h3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/MiniMax-H3-VDN-FP8-FL2VA.py)|-|-|-|-|-|
 |[OpenVDN/vdn-minimax-h3: VDN-H3 8 steps FP8](https://www.modelscope.cn/models/OpenVDN/vdn-minimax-h3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/MiniMax-H3-VDN-Turbo-FP8-FL2VA.py)|-|-|-|-|-|
+|[Lakonik/pi-H3: T2VA](https://www.modelscope.cn/models/Lakonik/pi-H3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/pi-H3-T2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/pi-H3-T2VA.py)|-|-|-|-|
+|[Lakonik/pi-H3: I2VA](https://www.modelscope.cn/models/Lakonik/pi-H3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/pi-H3-I2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/pi-H3-I2VA.py)|-|-|-|-|
+|[Lakonik/pi-H3: FL2VA](https://www.modelscope.cn/models/Lakonik/pi-H3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/pi-H3-FL2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/pi-H3-FL2VA.py)|-|-|-|-|
 
 The model weights are split into two partitions: the `FL2VA` partition serves text-to-video-audio and keyframe-guided generation, while the `Ref2VA` partition serves reference-driven generation. The two partitions have different DiT and text encoder weights, so choose the `origin_file_pattern` of the matching partition for your task.
 
 In addition, [PAI/MiniMax-H3-Fun-Controlnet-Union](https://www.modelscope.cn/models/PAI/MiniMax-H3-Fun-Controlnet-Union) provides ControlNet-based conditional control, which is used together with the base weights of the `FL2VA` partition. By passing a control video (canny / depth / hed / mlsd / pose modes) through `control_video`, you can generate video and audio that follow the structural conditions.
 
 ## Model Inference
+
+### pi-H3
+
+[Lakonik/pi-H3](https://www.modelscope.cn/models/Lakonik/pi-H3) uses 2-step or 4-step adapters with MiniMax-H3 Pruned FL2VA. DWD decodes pixels from the final denoiser features. VAE variants decode the final video latents. Both generate 24 fps video and synchronized 32 kHz stereo audio.
+
+```bash
+python examples/minimax_h3/model_inference/pi-H3-T2VA.py
+python examples/minimax_h3/model_inference_low_vram/pi-H3-I2VA.py
+python examples/minimax_h3/model_inference_low_vram/pi-H3-FL2VA.py
+```
+
+Load the Pruned transformer shards in `model_configs` and pass one official adapter as `pi_h3_adapter_config` to `MiniMaxH3Pipeline.from_pretrained()`. Pass the matching `num_inference_steps=2` or `4` at inference time. For a renamed adapter, also specify `pi_h3_num_steps` when loading. The examples expose `num_inference_steps` and `use_dwd` at the top of each file.
+
+Use `keyframe_indices=[0]` for a first frame, `[-1]` for a last frame, or `[0, -1]` for both. Frame counts are rounded up to `17n+5`. The aligned clip must be 5–15 seconds. Text-only DWD can omit the video VAE. The low-VRAM scripts enable layer-level CPU offload through the model configurations. Converting the official Pruned shards requires CPU or device loading for the DiT.
 
 The model is loaded via `MiniMaxH3Pipeline.from_pretrained`, see [Loading Models](../Pipeline_Usage/Model_Inference.md#loading-models) for details. Besides `model_configs`, the loading parameters include:
 

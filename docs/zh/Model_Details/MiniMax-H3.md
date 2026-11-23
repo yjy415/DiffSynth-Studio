@@ -84,12 +84,29 @@ write_video_audio(
 |[OpenVDN/vdn-minimax-h3: VDN-H3 8 步](https://www.modelscope.cn/models/OpenVDN/vdn-minimax-h3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/MiniMax-H3-VDN-Turbo-FL2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/MiniMax-H3-VDN-Turbo-FL2VA.py)|-|-|-|-|
 |[OpenVDN/vdn-minimax-h3: VDN-H3 FP8](https://www.modelscope.cn/models/OpenVDN/vdn-minimax-h3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/MiniMax-H3-VDN-FP8-FL2VA.py)|-|-|-|-|-|
 |[OpenVDN/vdn-minimax-h3: VDN-H3 8 步 FP8](https://www.modelscope.cn/models/OpenVDN/vdn-minimax-h3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/MiniMax-H3-VDN-Turbo-FP8-FL2VA.py)|-|-|-|-|-|
+|[Lakonik/pi-H3: T2VA](https://www.modelscope.cn/models/Lakonik/pi-H3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/pi-H3-T2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/pi-H3-T2VA.py)|-|-|-|-|
+|[Lakonik/pi-H3: I2VA](https://www.modelscope.cn/models/Lakonik/pi-H3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/pi-H3-I2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/pi-H3-I2VA.py)|-|-|-|-|
+|[Lakonik/pi-H3: FL2VA](https://www.modelscope.cn/models/Lakonik/pi-H3)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference/pi-H3-FL2VA.py)|[code](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/minimax_h3/model_inference_low_vram/pi-H3-FL2VA.py)|-|-|-|-|
 
 模型权重分为两个分区：`FL2VA` 分区服务文生音视频与首尾帧引导生成，`Ref2VA` 分区服务参考驱动生成，两者的 DiT 与文本编码器权重不同，需按任务选择对应分区的 `origin_file_pattern`。
 
 此外，[PAI/MiniMax-H3-Fun-Controlnet-Union](https://www.modelscope.cn/models/PAI/MiniMax-H3-Fun-Controlnet-Union) 提供 ControlNet 条件控制能力，需配合 `FL2VA` 分区的基础权重使用。通过 `control_video` 传入控制视频（canny / depth / hed / mlsd / pose 等控制模式），即可生成与结构条件一致的视频与音频。
 
 ## 模型推理
+
+### pi-H3
+
+[Lakonik/pi-H3](https://www.modelscope.cn/models/Lakonik/pi-H3) 基于 MiniMax-H3 Pruned FL2VA，提供 2 步和 4 步 adapter。DWD 版从最后一次去噪的特征生成像素，VAE 版从最终视频 latent 解码。两种版本均输出 24 fps 视频和同步的 32 kHz 立体声音频。
+
+```bash
+python examples/minimax_h3/model_inference/pi-H3-T2VA.py
+python examples/minimax_h3/model_inference_low_vram/pi-H3-I2VA.py
+python examples/minimax_h3/model_inference_low_vram/pi-H3-FL2VA.py
+```
+
+使用 `MiniMaxH3Pipeline.from_pretrained()` 加载模型。在 `model_configs` 中提供官方 Pruned Transformer 分片，将一个官方 adapter 传给 `pi_h3_adapter_config`。推理时传入匹配的 `num_inference_steps=2` 或 `4`。加载改名后的 adapter 时，还需在加载入口设置 `pi_h3_num_steps`。可以在示例顶部修改 `num_inference_steps` 和 `use_dwd` 切换变体。
+
+`keyframe_indices=[0]` 代表首帧，`[-1]` 代表尾帧，`[0, -1]` 代表首尾帧。帧数向上对齐到 `17n+5`，对齐后时长须为 5–15 秒。DWD 纯文生可以省略视频 VAE。低显存示例通过模型配置启用逐层 CPU 卸载。官方 Pruned 分片转换需要在 CPU 或执行设备上完成。
 
 模型通过 `MiniMaxH3Pipeline.from_pretrained` 加载，详见[加载模型](../Pipeline_Usage/Model_Inference.md#加载模型)。加载时除 `model_configs` 外还包括：
 
