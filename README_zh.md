@@ -88,6 +88,9 @@
 
 - **2026年8月19日** 我们发布了模型量化功能。它提供了统一的 `QuantizeConfig` 入口，支持 bitsandbytes、torchao、comfy-kitchen 等多种量化后端，具备在线量化、加载预量化权重、混合量化、保存量化模型、量化 + LoRA 训练等能力。详情请参考[文档](/docs/zh/Pipeline_Usage/Quantization.md)。
 
+<details>
+<summary>更多</summary>
+
 - **2026年8月17日** MiniMax-Music3 开源，欢迎加入音频生成模型家族！支持文生音乐推理和低显存推理能力。详情请参考[文档](/docs/zh/Model_Details/MiniMax-Music3.md)和[示例代码](/examples/minimax_music3/)。
 
 - **2026年8月7日** 我们为 Wan 系列新增了 Wan-Animate-2，输入一张参考图和一段驱动视频，即可让参考角色演绎驱动视频中的动作，生成高质量角色动画，包含标准与蒸馏两个变体。详情请参考[文档](/docs/zh/Model_Details/Wan.md)和[示例代码](/examples/wanvideo/)。
